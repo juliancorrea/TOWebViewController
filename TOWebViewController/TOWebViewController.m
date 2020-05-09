@@ -65,10 +65,10 @@
                                    CAAnimationDelegate,
                                    MFMailComposeViewControllerDelegate,
                                    MFMessageComposeViewControllerDelegate,
-                                   NJKWebViewProgressDelegate,CAAnimationDelegate>
+                                   NJKWebViewProgressDelegate,CAAnimationDelegate, WKNavigationDelegate>
 {
     
-    //The state of the UIWebView's scroll view before the rotation animation has started
+    //The state of the WebView's scroll view before the rotation animation has started
     struct {
         CGSize     frameSize;
         CGSize     contentSize;
@@ -88,7 +88,7 @@
 @property (nonatomic,readonly) BOOL splitScreenEnabled;               /* Used to detect if the app is presented in split screen mode for performance reasons. */
 
 /* The main view components of the controller */
-@property (nonatomic,strong, readwrite) UIWebView *webView;           /* The web view, where all the magic happens */
+@property (nonatomic,strong, readwrite) WKWebView *webView;           /* The web view, where all the magic happens */
 @property (nonatomic,readonly) UINavigationBar *navigationBar;        /* Navigation bar shown along the top of the view */
 @property (nonatomic,readonly) UIToolbar *toolbar;                    /* Toolbar shown along the bottom */
 @property (nonatomic,strong)   UIImageView *webViewRotationSnapshot;  /* A snapshot of the web view, shown when rotating */
@@ -171,7 +171,7 @@
 #pragma mark - Class Cleanup -
 - (void)dealloc
 {
-    self.webView.delegate = nil;
+//    self.webView.delegate = nil;
 }
 
 #pragma mark - Setup -
@@ -226,13 +226,20 @@
         self.gradientLayer.frame = self.view.bounds;
         [self.view.layer addSublayer:self.gradientLayer];
     }
+    NSString *jScript = @"var meta = document.createElement('meta'); meta.setAttribute('name', 'viewport'); meta.setAttribute('content', 'width=device-width'); document.getElementsByTagName('head')[0].appendChild(meta);";
+
+    WKUserScript *wkUScript = [[WKUserScript alloc] initWithSource:jScript injectionTime:WKUserScriptInjectionTimeAtDocumentEnd forMainFrameOnly:YES];
+    WKUserContentController *wkUController = [[WKUserContentController alloc] init];
+    [wkUController addUserScript:wkUScript];
+
+    WKWebViewConfiguration *wkWebConfig = [[WKWebViewConfiguration alloc] init];
+    wkWebConfig.userContentController = wkUController;
     
     //Create the web view
-    self.webView = [[UIWebView alloc] initWithFrame:self.view.bounds];
-    self.webView.delegate = self.progressManager;
+    self.webView = [[WKWebView alloc] initWithFrame:self.view.frame configuration:wkWebConfig];
+//    self.webView.delegate = self.progressManager;
     self.webView.backgroundColor = [UIColor clearColor];
     self.webView.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleWidth;
-    self.webView.scalesPageToFit = YES;
     self.webView.contentMode = UIViewContentModeRedraw;
     self.webView.opaque = NO; // Must  be NO to avoid the initial black bars
     if (@available(iOS 11.0, *)) {
@@ -359,7 +366,7 @@
 {
     [super viewDidAppear:animated];
     //start loading the initial page
-    if (self.url && self.webView.request == nil)
+    if (self.url && self.webView.URL == nil)
     {
         [self.urlRequest setURL:self.url];
         [self.webView loadRequest:self.urlRequest];
@@ -790,28 +797,24 @@
 
 #pragma mark -
 #pragma mark WebView Delegate
-- (BOOL)webView:(UIWebView *)webView shouldStartLoadWithRequest:(NSURLRequest *)request navigationType:(UIWebViewNavigationType)navigationType
-{
-    BOOL shouldStart = YES;
+
+- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
     
     //If a request handler has been set, check to see if we should go ahead
-    if (self.shouldStartLoadRequestHandler) {
-        shouldStart = self.shouldStartLoadRequestHandler(request, navigationType);
+    if (self.decidePolicyForNavigationAction) {
+        self.decidePolicyForNavigationAction(navigationAction);//,decisionHandler);
     }
-        
-    return shouldStart;
 }
 
-- (void)webView:(UIWebView *)webView didFailLoadWithError:(NSError *)error
-{
+- (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
     //If a request handler has been set, check to see if we should go ahead
     if (self.didFailLoadWithErrorRequestHandler) {
         return self.didFailLoadWithErrorRequestHandler(error);
     }
 }
 
-- (void)webViewDidStartLoad:(UIWebView *)webView
-{
+- (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation {
+
     //show that loading started in the status bar
     [[UIApplication sharedApplication] setNetworkActivityIndicatorVisible:YES];
     
@@ -819,10 +822,10 @@
     [self refreshButtonsState];
 }
 
--(void)webViewDidFinishLoad:(UIWebView *)webView
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation
 {
-    if (self.didFinishLoadHandler) {
-        self.didFinishLoadHandler(webView);
+    if (self.didFinishNavigationHandler) {
+        self.didFinishNavigationHandler(webView, navigation);
     }
 }
 
@@ -831,43 +834,55 @@
 {
     [self.progressView setProgress:progress animated:YES];
     
-    // Once loading has started, the black bars bug in UIWebView will be gone, so we can
+    // Once loading has started, the black bars bug in WebView will be gone, so we can
     // swap back to opaque for performance
     if (self.webView.opaque == NO) {
         self.webView.opaque = YES;
     }
     
-    //Query the webview to see what load state JavaScript perceives it at
-    NSString *readyState = [self.webView stringByEvaluatingJavaScriptFromString:@"document.readyState"];
+    [self.webView evaluateJavaScript:@"document.readyState" completionHandler:^(id _Nullable result, NSError * _Nullable error) {
+        //Query the webview to see what load state JavaScript perceives it at
+        NSString *readyState = result;
+           
+           //interactive means the page has loaded sufficiently to allow user interaction now
+           BOOL interactive = [readyState isEqualToString:@"interactive"];
+           BOOL complete = [readyState isEqualToString:@"complete"];
+           if (interactive || complete)
+           {
+               //see if we can set the proper page title yet
+               if (self.showPageTitles) {
+                   [self.webView evaluateJavaScript:@"document.title" completionHandler:^(id _Nullable result, NSError * _Nullable error) {
+                       NSString *title = result;
+                       
+                       if (title.length)
+                           self.title = title;
+                   }];
+                   
+               } else if (self.showPageHost) {
+                   [self.webView evaluateJavaScript:@"window.location.hostname" completionHandler:^(id _Nullable result, NSError * _Nullable error) {
+                       NSString *host = result;
+                        if (host.length) {
+                            self.title = [self shortenHostname:host];
+                        }
+                   }];
+                   
+                 
+               }
+               
+               //if we're matching the view BG to the web view, update the background colour now
+               if (self.hideWebViewBoundaries)
+                   self.view.backgroundColor = [self webViewPageBackgroundColor];
+               
+               //finally, if the app desires it, disable the ability to tap and hold on links
+               if (self.disableContextualPopupMenu){
+                   [self.webView evaluateJavaScript:@"document.body.style.webkitTouchCallout='none';" completionHandler:nil];
+               }
+           }
+           
+           [self refreshButtonsState];
+    }];
     
-    //interactive means the page has loaded sufficiently to allow user interaction now
-    BOOL interactive = [readyState isEqualToString:@"interactive"];
-    BOOL complete = [readyState isEqualToString:@"complete"];
-    if (interactive || complete)
-    {
-        //see if we can set the proper page title yet
-        if (self.showPageTitles) {
-            NSString *title = [self.webView stringByEvaluatingJavaScriptFromString:@"document.title"];
-            
-            if (title.length)
-                self.title = title;
-        } else if (self.showPageHost) {
-            NSString *host = [self.webView stringByEvaluatingJavaScriptFromString:@"window.location.hostname"];
-            if (host.length) {
-                self.title = [self shortenHostname:host];
-            }
-        }
-        
-        //if we're matching the view BG to the web view, update the background colour now
-        if (self.hideWebViewBoundaries)
-            self.view.backgroundColor = [self webViewPageBackgroundColor];
-        
-        //finally, if the app desires it, disable the ability to tap and hold on links
-        if (self.disableContextualPopupMenu)
-            [self.webView stringByEvaluatingJavaScriptFromString:@"document.body.style.webkitTouchCallout='none';"];
-    }
-    
-    [self refreshButtonsState];
+   
 }
 
 - (NSString *)shortenHostname:(NSString *)hostname {
@@ -910,7 +925,7 @@
     //Any potential user-specified buttons
     if (self.loadCompletedApplicationBarButtonItems) {
         BOOL enabled = NO;
-        if (loaded && self.webView.request.URL.absoluteURL) {
+        if (loaded && self.webView.URL.absoluteURL) {
             enabled = YES;
         }
         
@@ -957,7 +972,7 @@
         //it nullifies webView.request, which causes [webView reload] to stop working.
         //This checks to see if the webView request URL is nullified, and if so, tries to load
         //off our stored self.url property instead
-        if (self.webView.request.URL.absoluteString.length == 0 && self.url)
+        if (self.webView.URL.absoluteString.length == 0 && self.url)
         {
             [self.webView loadRequest:self.urlRequest];
         }
@@ -1137,7 +1152,7 @@
 - (void)openInBrowser
 {
     BOOL chromeIsInstalled = [[UIApplication sharedApplication] canOpenURL:[NSURL URLWithString:@"googlechrome://"]];
-    NSURL *inputURL = self.webView.request.URL;
+    NSURL *inputURL = self.webView.URL;
     
     if (chromeIsInstalled)
     {
@@ -1211,7 +1226,7 @@
 }
 
 #pragma mark -
-#pragma mark UIWebView Attrbutes
+#pragma mark WebView Attrbutes
 - (UIView *)webViewContentView
 {
     //loop through the views inside the webview, and pull out the one that renders the HTML content
@@ -1236,7 +1251,11 @@
                                 @"}"
                                 @"})()";
     
-    NSString *pageViewPortContent = [self.webView stringByEvaluatingJavaScriptFromString:metaDataQuery];
+    __block NSString *pageViewPortContent = nil;
+    [self.webView evaluateJavaScript:metaDataQuery completionHandler:^(id _Nullable result, NSError * _Nullable error) {
+        pageViewPortContent = result;
+    }];
+    
     if ([pageViewPortContent length] == 0) {
         return NO;
     }
@@ -1265,13 +1284,18 @@
     }
     
     return NO;
+    
 }
 
 - (UIColor *)webViewPageBackgroundColor
 {
     //Pull the current background colour from the web view
-    NSString *rgbString = [self.webView stringByEvaluatingJavaScriptFromString:@"window.getComputedStyle(document.body,null).getPropertyValue('background-color');"];
+    __block NSString *rgbString = nil;
+    [self.webView evaluateJavaScript:@"window.getComputedStyle(document.body,null).getPropertyValue('background-color');" completionHandler:^(id _Nullable result, NSError * _Nullable error) {
+        rgbString = result;
+    }];
     
+//    [NSThread sleepForTimeInterval:100]
     //if it wasn't found, or if it isn't a proper rgb value, just return white as the default
     if ([rgbString length] == 0 || [rgbString rangeOfString:@"rgb"].location == NSNotFound)
         return [UIColor whiteColor];
@@ -1309,7 +1333,7 @@
 }
 
 #pragma mark -
-#pragma mark UIWebView Interface Rotation Handler
+#pragma mark WebView Interface Rotation Handler
 - (CGRect)rectForVisibleRegionOfWebViewAnimatingToOrientation:(UIInterfaceOrientation)toInterfaceOrientation
 {
     CGRect  rect            = CGRectZero;
@@ -1526,7 +1550,7 @@
     [self.view insertSubview:self.webViewRotationSnapshot aboveSubview:self.webView];
     
     
-    //This is a dirty, dirty, DIRTY hack. When a UIWebView's frame changes (At least on iOS 6), in certain conditions,
+    //This is a dirty, dirty, DIRTY hack. When a WebView's frame changes (At least on iOS 6), in certain conditions,
     //the content view will NOT resize with it. This can result in visual artifacts, such as black bars up the side,
     //and weird touch feedback like not being able to properly zoom out until the user has first zoomed in and released the touch.
     //So far, the only way I've found to actually correct this is to invoke a trivial zoom animation, and this will
@@ -1642,7 +1666,7 @@
     if (!self.compactPresentation && self.modalPresentationStyle == UIModalPresentationFormSheet)
         return;
     
-    //Side Note: When a UIWebView has just had its bounds change, its minimumZoomScale and maximumZoomScale become completely (almost arbitrarily) different.
+    //Side Note: When a WebView has just had its bounds change, its minimumZoomScale and maximumZoomScale become completely (almost arbitrarily) different.
     //But, it WILL rest back to minimumZoomScale = 1.0f, after the next time the user interacts with it.
     //For resetting the state right now (as the user hasn't touched it yet), we must use the 'different' values, and translate the original state to them.
     //---
